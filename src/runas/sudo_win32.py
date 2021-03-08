@@ -180,14 +180,7 @@ def can_get_root():
         kernel32.CloseHandle(proc)
 
 
-class KillablePopen(subprocess.Popen):
-    """Popen that's guaranteed killable, even on python2.5."""
-    if not hasattr(subprocess.Popen, "terminate"):
-        def terminate(self):
-            kernel32.TerminateProcess(self._handle, -1)
-
-
-class FakePopen(KillablePopen):
+class FakePopen(subprocess.Popen):
     """Popen-alike based on a raw process handle."""
 
     def __init__(self, handle):
@@ -230,11 +223,10 @@ class SecureStringPipe(base.SecureStringPipe):
         super().__init__(token)
         if pipename is None:
             self.pipename = r"\\.\pipe\runas-" + uuid.uuid4().hex
-            if sys.version_info[0] > 2:
-                self.pipename = self.pipename.encode('utf8')
+            self.pipename = self.pipename.encode('utf8')
             self.pipe = kernel32.CreateNamedPipeA(self.pipename, 0x03, 0x00, 1, 8192, 8192, 0, None)
         else:
-            self.pipename = pipename.encode('utf8')
+            self.pipename = pipename
             self.pipe = None
 
     def connect(self):
@@ -282,15 +274,16 @@ def spawn_sudo(proxy):
     c_pipe = pipe.connect()
 
     exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
-    args = ["--runas-spawn-sudo", base.b64pickle(proxy), base.b64pickle(c_pipe)]
+    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy),
+            base.b64pickle(c_pipe)]
     exe = exe + args
     execinfo = SHELLEXECUTEINFO()
     execinfo.cbSize = sizeof(execinfo)
     execinfo.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
     execinfo.hwnd = None
     execinfo.lpVerb = b"runas"
-    execinfo.lpFile = exe[0].encode('utf-8')
-    execinfo.lpParameters = " ".join(exe[1:]).encode('utf-8')
+    execinfo.lpFile = exe[0].encode('cp1252')
+    execinfo.lpParameters = subprocess.list2cmdline(exe[1:]).encode('cp1252')
     execinfo.lpDirectory = None
     execinfo.nShow = 0
     ShellExecuteEx(byref(execinfo))
@@ -300,7 +293,8 @@ def spawn_sudo(proxy):
 
 def run_proxy_startup():
     if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
-        proxy = base.b64unpickle(sys.argv[2])
-        pipe = base.b64unpickle(sys.argv[3])
+        sys.path = base.b64unpickle(sys.argv[2])
+        proxy = base.b64unpickle(sys.argv[3])
+        pipe = base.b64unpickle(sys.argv[4])
         proxy.run(pipe)
         sys.exit(0)
