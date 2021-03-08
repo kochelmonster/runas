@@ -1,6 +1,6 @@
 #  All rights reserved; available under the terms of the BSD License.
 """
-runas.sudo_unix:  unix platform-specific functionality for esky.sudo
+runas.sudo_unix:  unix platform-specific functionality
 """
 import os
 import sys
