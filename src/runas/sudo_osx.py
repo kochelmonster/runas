@@ -4,13 +4,13 @@ runas.sudo_osx:  unix platform-specific functionality for esky.sudo
 """
 import os
 import sys
-import errno
 import subprocess
 import tempfile
 from shlex import quote
 from . import sudo_base as base
 from .sudo_unix import has_root, can_get_root, SecureStringPipe, run_proxy_startup
 
+__all__ = ("has_root", "can_get_root", "run_proxy_startup")
 
 if sys.platform != "darwin":
     raise ImportError("only usable on OSX")
