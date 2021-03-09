@@ -34,13 +34,13 @@ import pickle
 
 
 if sys.platform == "win32":
-    from . import sudo_win32 as sudo
+    from . import win32 as sudo
 else:
-    from . import sudo_posix as sudo
+    from . import posix as sudo
 
 
-def spawn_sudo(proxy, user, password):
-    return sudo.spawn_sudo(proxy, user, password)
+def spawn_sudo(proxy, user, password, domain=""):
+    return sudo.spawn_sudo(proxy, user, password, domain)
 
 
 def has_root():

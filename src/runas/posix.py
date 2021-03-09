@@ -1,14 +1,12 @@
-#  All rights reserved; available under the terms of the BSD License.
+#  All rights reserved; available under the terms of the MIT License.
 """
-runas.sudo_unix:  unix platform-specific functionality
+posix specific functionality
 """
 import os
 import sys
-import errno
 import subprocess
-import tempfile
 import logging
-from . import sudo_base as base
+from . import base
 
 logger = logging.getLogger("runas")
 
@@ -38,25 +36,7 @@ def find_exe(name, *args):
     return None
 
 
-class StdPipe(base.StringPipe):
-    def __init__(self, read, write):
-        self.read_stream = read
-        self.write_stream = write
-
-    def _read(self, size):
-        return self.read_stream.read(size)
-
-    def _write(self, data):
-        self.write_stream.write(data)
-        self.write_stream.flush()
-
-    def close(self):
-        super().close()
-        self.read_stream.close()
-        self.write_stream.close()
-
-
-def spawn_sudo(proxy, user, password):
+def spawn_sudo(proxy, user, password, domain):
     """Spawn the sudo slave process, returning proc and a pipe to message it."""
     exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
     args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy)]
@@ -81,7 +61,7 @@ def spawn_sudo(proxy, user, password):
     proc = subprocess.Popen(exe, **kwds)
     proc.stdin.write(password.encode("utf8")+b"\n")
     proc.stdin.flush()
-    return proc, StdPipe(proc.stdout, proc.stdin)
+    return proc, base.StdPipe(proc.stdout, proc.stdin)
 
 
 def run_proxy_startup():
@@ -89,6 +69,6 @@ def run_proxy_startup():
     if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
         sys.path = base.b64unpickle(sys.argv[2])
         proxy = base.b64unpickle(sys.argv[3])
-        proxy.run(StdPipe(os.fdopen(sys.stdin.fileno(), "rb"),
-                          os.fdopen(sys.stdout.fileno(), "wb")))
+        proxy.run(base.StdPipe(os.fdopen(sys.stdin.fileno(), "rb"),
+                               os.fdopen(sys.stdout.fileno(), "wb")))
         sys.exit(0)

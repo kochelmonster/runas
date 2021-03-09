@@ -1,20 +1,13 @@
 #  Copyright (c) 2009-2010, Cloud Matrix Pty. Ltd.
 #  All rights reserved; available under the terms of the BSD License.
 """
-
-  esky.sudo.sudo_base:  base functionality for esky sudo helpers
-
+base functionality for runas
 """
-
 
 import sys
 import base64
 import struct
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+import pickle
 
 
 def b64pickle(obj):
@@ -43,21 +36,24 @@ def can_get_root():
     return True
 
 
-class StringPipe:
-    def __init__(self):
-        self.connected = False
+class StdPipe:
+    def __init__(self, read, write):
+        self.read_stream = read
+        self.write_stream = write
+
+    def _read(self, size):
+        return self.read_stream.read(size)
+
+    def _write(self, data):
+        self.write_stream.write(data)
+        self.write_stream.flush()
+
+    def close(self):
+        self.read_stream.close()
+        self.write_stream.close()
 
     def __del__(self):
         self.close()
-
-    def _read(self, size):
-        raise NotImplementedError
-
-    def _write(self, data):
-        raise NotImplementedError
-
-    def close(self):
-        self.connected = False
 
     def read(self):
         """Read the next string from the pipe.
