@@ -46,6 +46,8 @@ def spawn_sudo(proxy, user, password, domain):
         raise RuntimeError("no sudo found")
 
     # Make it a slave process so it dies if we die
+    sudo.append("-p")
+    sudo.append("")
     sudo.append("-k")
     sudo.append("-u")
     sudo.append(user)
@@ -54,18 +56,29 @@ def spawn_sudo(proxy, user, password, domain):
     # Pass the pipe in environment vars, they seem to be harder to snoop.
 
     # Spawn the subprocess
-    nul = subprocess.DEVNULL
     pipe = subprocess.PIPE
-    kwds = dict(stdin=pipe, stdout=pipe, stderr=nul, close_fds=True, text=False)
+    kwds = dict(stdin=pipe, stdout=pipe, stderr=pipe, close_fds=True, text=False)
+    # kwds = dict(stdin=pipe, stdout=pipe, close_fds=True, text=False)
     logger.debug("start subprocess %r", exe)
     proc = subprocess.Popen(exe, **kwds)
     proc.stdin.write(password.encode("utf8")+b"\n")
     proc.stdin.flush()
+
+    result = proc.stderr.read(1)
+    proc.stderr.close()
+    if result != b"@":
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.kill()
+        raise RuntimeError("wrong password")
+
     return proc, base.StdPipe(proc.stdout, proc.stdin)
 
 
 def run_proxy_startup():
     logger.debug("run_proxy_startup %r", sys.argv)
+    sys.stderr.write("@")
+    sys.stderr.flush()
     if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
         sys.path = base.b64unpickle(sys.argv[2])
         proxy = base.b64unpickle(sys.argv[3])
