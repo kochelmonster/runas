@@ -1,17 +1,22 @@
-#  All rights reserved; available under the terms of the MIT License.
+#  All rights reserved; available under the terms of the BSD License.
 """
-win32 platform-specific functionality for runas
+runas.sudo_win32:  win32 platform-specific functionality for runas
+
+This module implements the runas interface using ctypes bindings to the
+native win32 API. In particular, it uses the "runas" verb technique to
+launch a process with administrative rights on Windows Vista and above.
 """
-import sys
-import uuid
+
 import ctypes
 import ctypes.wintypes
+import hmac
+import os
 import subprocess
-import pickle
-import logging
+import struct
+import sys
+import uuid
 from . import base
 
-logger = logging.getLogger("runas")
 
 byref = ctypes.byref
 sizeof = ctypes.sizeof
@@ -71,7 +76,6 @@ else:
     ShellExecuteEx.argtypes = (
         ctypes.POINTER(SHELLEXECUTEINFO),
     )
-
 
 try:
     OpenProcessToken = advapi32.OpenProcessToken
@@ -179,48 +183,6 @@ def can_get_root():
         kernel32.CloseHandle(proc)
 
 
-class Win32Pipe(base.StdPipe):
-    def __init__(self, pipename=None):
-        if pipename is None:
-            self.pipename = r"\\.\pipe\runas-" + uuid.uuid4().hex
-            self.pipename = self.pipename.encode('utf8')
-            self.pipe = kernel32.CreateNamedPipeA(self.pipename, 0x03, 0x00, 1, 8192, 8192, 0, None)
-            self.connected = False
-        else:
-            self.pipename = pipename
-            self.pipe = kernel32.CreateFileA(
-                self.pipename, GENERIC_RDWR, 0, None, OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
-            self.connected = True
-
-    def check_connection(self):
-        if not self.connected:
-            logger.debug("##++connect", stack_info=True)
-            kernel32.ConnectNamedPipe(self.pipe, None)
-            logger.debug("##--connect")
-            self.connected = True
-
-    def close(self):
-        if self.pipe is not None:
-            kernel32.CloseHandle(self.pipe)
-            self.pipe = None
-
-    def _read(self, size):
-        self.check_connection()
-        data = ctypes.create_string_buffer(size)
-        szread = ctypes.c_int()
-        logger.debug("++read %r", size)
-        kernel32.ReadFile(self.pipe, data, size, byref(szread), None)
-        logger.debug("--read %r\n%r", size, data.raw[:szread.value])
-        return data.raw[:szread.value]
-
-    def _write(self, data):
-        self.check_connection()
-        szwritten = ctypes.c_int()
-        logger.debug("write %r", data)
-        kernel32.WriteFile(self.pipe, data, len(data), byref(szwritten), None)
-
-
 class FakePopen(subprocess.Popen):
     """Popen-alike based on a raw process handle."""
 
@@ -235,15 +197,130 @@ class FakePopen(subprocess.Popen):
         pass
 
 
+class SecureStringPipe:
+    """Two-way pipe for securely communicating strings with a sudo subprocess.
+
+    This is the control pipe used for passing command data from the non-sudo
+    master process to the sudo slave process.  Use read() to read the next
+    string, write() to write the next string.
+
+    As a security measure, all strings are "signed" using a rolling hmac based
+    off a shared security token.  A bad signature results in the pipe being
+    immediately closed and a RuntimeError being generated.
+
+    On win32, this is implemented using CreateNamedPipe in the non-sudo
+    master process, and connecting to the pipe from the sudo slave process.
+
+    Security considerations to prevent hijacking of the pipe:
+
+        * it has a strongly random name, so there can be no race condition
+          before the pipe is created.
+        * it has nMaxInstances set to 1 so another process cannot spoof the
+          pipe while we are still alive.
+        * the slave connects with pipe client impersonation disabled.
+
+    A possible attack vector would be to wait until we spawn the slave process,
+    capture the name of the pipe, then kill us and re-create the pipe to become
+    the new master process.  Not sure what can be done about this, but at the
+    very worst this will allow the attacker to call into the esky API with
+    root privs; it *shouldn't* be sufficient to crack root on the machine...
+    """
+
+    def __init__(self, token=None, pipename=None):
+        if token is None:
+            token = os.urandom(16)
+        self.token = token
+        self.connected = False
+
+        if pipename is None:
+            self.pipename = r"\\.\pipe\runas-" + uuid.uuid4().hex
+            self.pipename = self.pipename.encode('utf8')
+            self.pipe = kernel32.CreateNamedPipeA(self.pipename, 0x03, 0x00, 1, 8192, 8192, 0, None)
+        else:
+            self.pipename = pipename
+            self.pipe = None
+
+    def __del__(self):
+        self.close()
+
+    def connect(self):
+        return SecureStringPipe(self.token, self.pipename)
+
+    def _read(self, size):
+        data = ctypes.create_string_buffer(size)
+        szread = ctypes.c_int()
+        kernel32.ReadFile(self.pipe, data, size, byref(szread), None)
+        return data.raw[:szread.value]
+
+    def _write(self, data):
+        szwritten = ctypes.c_int()
+        kernel32.WriteFile(self.pipe, data, len(data), byref(szwritten), None)
+
+    def close(self):
+        if self.pipe is not None:
+            kernel32.CloseHandle(self.pipe)
+            self.pipe = None
+        self.connected = False
+
+    def _open(self):
+        if self.pipe is None:
+            self.pipe = kernel32.CreateFileA(
+                self.pipename, GENERIC_RDWR, 0, None, OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
+        else:
+            kernel32.ConnectNamedPipe(self.pipe, None)
+
+    def check_connection(self):
+        if not self.connected:
+            self._read_hmac = hmac.new(self.token, digestmod="sha256")
+            self._write_hmac = hmac.new(self.token, digestmod="sha256")
+            self._open()
+            self.connected = True
+
+    def read(self):
+        """Read the next string from the pipe.
+
+        The expected data format is:  4-byte size, data, signature
+        """
+        self.check_connection()
+        sz = self._read(4)
+        if len(sz) < 4:
+            raise EOFError
+        sz = struct.unpack("I", sz)[0]
+        data = self._read(sz)
+        if len(data) < sz:
+            raise EOFError
+        sig = self._read(self._read_hmac.digest_size)
+        self._read_hmac.update(data)
+        if sig != self._read_hmac.digest():
+            self.close()
+            raise RuntimeError("mismatched hmac; terminating")
+        return data
+
+    def write(self, data):
+        """Write the given string to the pipe.
+
+        The expected data format is:  4-byte size, data, signature
+        """
+        self.check_connection()
+        self._write(struct.pack("I", len(data)))
+        self._write(data)
+        self._write_hmac.update(data)
+        self._write(self._write_hmac.digest())
+
+
 def spawn_sudo(proxy, user, password, domain):
     """Spawn the sudo slave process, returning proc and a pipe to message it.
 
     This function spawns the proxy app with administrator privileges, using
     ShellExecuteEx and the undocumented-but-widely-recommended "runas" verb.
     """
-    pipe = Win32Pipe()
+    pipe = SecureStringPipe()
+    c_pipe = pipe.connect()
+
     exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
-    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy), pipe.pipename]
+    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy),
+            base.b64pickle(c_pipe)]
     exe = exe + args
     execinfo = SHELLEXECUTEINFO()
     execinfo.cbSize = sizeof(execinfo)
@@ -256,76 +333,13 @@ def spawn_sudo(proxy, user, password, domain):
     execinfo.nShow = 0
     ShellExecuteEx(byref(execinfo))
     proc = FakePopen(execinfo.hProcess)
-    logger.debug("##started process %r %r", proc.pid, pipe.pipename)
     return (proc, pipe)
 
 
-def _spawn_sudo(proxy, user, password, domain):
-    """Spawn the sudo slave process, returning proc and a pipe to message it.
-
-    This function spawns the proxy app with administrator privileges, using
-    ShellExecuteEx and the undocumented-but-widely-recommended "runas" verb.
-    """
-    exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
-    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy)]
-    exe = exe + args
-    nul = subprocess.DEVNULL
-    pipe = subprocess.PIPE
-
-    si = subprocess.STARTUPINFO()
-    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = subprocess.SW_HIDE
-    kwds = dict(stdin=pipe, stdout=pipe, stderr=nul, close_fds=False, text=False,
-                creationflags=subprocess.CREATE_NO_WINDOW, bufsize=0)
-    # kwds = dict(text=False)
-    logger.debug("start subprocess %r", exe)
-    proc = subprocess.Popen(exe, **kwds)
-
-    pipe = base.StdPipe(proc.stdout, proc.stdin)
-    pipe.write(pickle.dumps((user, domain, password)))
-    result = pickle.loads(pipe.read())
-    if not result:
-        proc.stdin.close()
-        proc.stdout.close()
-        proc.kill()
-        raise RuntimeError("wrong credentials")
-
-    logger.debug("wrote credencials %r", result)
-    return proc, pipe
-
-
 def run_proxy_startup():
-    log_format = (
-        "> runas %(created)f %(levelname)s %(name)s %(pathname)s(%(lineno)d): %(message)s")
-    logging.basicConfig(level=logging.DEBUG, format=log_format, filename="runasc.log", filemode="w")
-    logger.debug("_start proxy %r", sys.argv)
-    try:
-        if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
-            sys.path = base.b64unpickle(sys.argv[2])
-            proxy = base.b64unpickle(sys.argv[3])
-            pipename = sys.argv[4]
-            logger.debug("_loaded pipe %r", pipename)
-            pipe = Win32Pipe(pipename)
-            logger.debug("_connected to pipe %r", pipename)
-
-            """
-            user, domain, password = pickle.loads(pipe.read())
-            try:
-                handle = win32security.LogonUser(
-                    user, domain, password, win32con.LOGON32_LOGON_INTERACTIVE,
-                    win32con.LOGON32_PROVIDER_DEFAULT)
-                win32security.ImpersonateLoggedOnUser(handle)
-                pipe.write(pickle.dumps(True))
-            except Exception as e:
-                logger.exception("error impersonating %r\n%r", e, (user, domain, password))
-                pipe.write(pickle.dumps(False))
-                sys.exit(1)
-            """
-
-            proxy.run(pipe)
-            logger.debug("_done")
-            # win32security.RevertToSelf()
-            # handle.close()
-            sys.exit(0)
-    except BaseException as e:
-        logger.exception("error %r", e)
+    if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
+        sys.path = base.b64unpickle(sys.argv[2])
+        proxy = base.b64unpickle(sys.argv[3])
+        pipe = base.b64unpickle(sys.argv[4])
+        proxy.run(pipe)
+        sys.exit(0)
