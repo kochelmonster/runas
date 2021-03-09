@@ -26,12 +26,12 @@ We also provide some handy utility functions:
     * can_get_root():  check whether current process may be able to get root
 """
 
-from __future__ import absolute_import
-
 import sys
 import functools
 import pickle
+import logging
 
+logger = logging.getLogger("runas")
 
 if sys.platform == "win32":
     from . import win32 as sudo
@@ -75,9 +75,12 @@ class SudoProxy:
             raise RuntimeError("sudo helper process terminated unexpectedly")
         #  Try to read initialisation message from the pipe.
         #  If this fails, the helper program must have died.
+
+        logger.debug("##start read")
         try:
             msg = self.pipe.read()
         except EOFError:
+            logger.debug("##eof")
             msg = b""
         if msg != b"READY":
             self.close()

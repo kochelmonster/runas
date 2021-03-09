@@ -2,13 +2,11 @@
 """
 win32 platform-specific functionality for runas
 """
-import os
 import sys
+import uuid
 import ctypes
 import ctypes.wintypes
 import subprocess
-import win32security
-import win32con
 import pickle
 import logging
 from . import base
@@ -41,6 +39,38 @@ def _errcheck_bool(value, func, args):
     if not value:
         raise ctypes.WinError()
     return args
+
+
+class SHELLEXECUTEINFO(ctypes.Structure):
+    _fields_ = (
+      ("cbSize", ctypes.wintypes.DWORD),
+      ("fMask", ctypes.c_ulong),
+      ("hwnd", ctypes.wintypes.HANDLE),
+      ("lpVerb", ctypes.c_char_p),
+      ("lpFile", ctypes.c_char_p),
+      ("lpParameters", ctypes.c_char_p),
+      ("lpDirectory", ctypes.c_char_p),
+      ("nShow", ctypes.c_int),
+      ("hInstApp", ctypes.wintypes.HINSTANCE),
+      ("lpIDList", ctypes.c_void_p),
+      ("lpClass", ctypes.c_char_p),
+      ("hKeyClass", ctypes.wintypes.HKEY),
+      ("dwHotKey", ctypes.wintypes.DWORD),
+      ("hIconOrMonitor", ctypes.wintypes.HANDLE),
+      ("hProcess", ctypes.wintypes.HANDLE),
+    )
+
+
+try:
+    ShellExecuteEx = shell32.ShellExecuteEx
+except AttributeError:
+    ShellExecuteEx = None
+else:
+    ShellExecuteEx.restype = ctypes.wintypes.BOOL
+    ShellExecuteEx.errcheck = _errcheck_bool
+    ShellExecuteEx.argtypes = (
+        ctypes.POINTER(SHELLEXECUTEINFO),
+    )
 
 
 try:
@@ -149,7 +179,88 @@ def can_get_root():
         kernel32.CloseHandle(proc)
 
 
+class Win32Pipe(base.StdPipe):
+    def __init__(self, pipename=None):
+        if pipename is None:
+            self.pipename = r"\\.\pipe\runas-" + uuid.uuid4().hex
+            self.pipename = self.pipename.encode('utf8')
+            self.pipe = kernel32.CreateNamedPipeA(self.pipename, 0x03, 0x00, 1, 8192, 8192, 0, None)
+            self.connected = False
+        else:
+            self.pipename = pipename
+            self.pipe = kernel32.CreateFileA(
+                self.pipename, GENERIC_RDWR, 0, None, OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, None)
+            self.connected = True
+
+    def check_connection(self):
+        if not self.connected:
+            logger.debug("##++connect", stack_info=True)
+            kernel32.ConnectNamedPipe(self.pipe, None)
+            logger.debug("##--connect")
+            self.connected = True
+
+    def close(self):
+        if self.pipe is not None:
+            kernel32.CloseHandle(self.pipe)
+            self.pipe = None
+
+    def _read(self, size):
+        self.check_connection()
+        data = ctypes.create_string_buffer(size)
+        szread = ctypes.c_int()
+        logger.debug("++read %r", size)
+        kernel32.ReadFile(self.pipe, data, size, byref(szread), None)
+        logger.debug("--read %r\n%r", size, data.raw[:szread.value])
+        return data.raw[:szread.value]
+
+    def _write(self, data):
+        self.check_connection()
+        szwritten = ctypes.c_int()
+        logger.debug("write %r", data)
+        kernel32.WriteFile(self.pipe, data, len(data), byref(szwritten), None)
+
+
+class FakePopen(subprocess.Popen):
+    """Popen-alike based on a raw process handle."""
+
+    def __init__(self, handle):
+        super().__init__(None)
+        self._handle = handle
+
+    def terminate(self):
+        kernel32.TerminateProcess(self._handle, -1)
+
+    def _execute_child(self, *args, **kwds):
+        pass
+
+
 def spawn_sudo(proxy, user, password, domain):
+    """Spawn the sudo slave process, returning proc and a pipe to message it.
+
+    This function spawns the proxy app with administrator privileges, using
+    ShellExecuteEx and the undocumented-but-widely-recommended "runas" verb.
+    """
+    pipe = Win32Pipe()
+    exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
+    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy), pipe.pipename]
+    exe = exe + args
+    execinfo = SHELLEXECUTEINFO()
+    execinfo.cbSize = sizeof(execinfo)
+    execinfo.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    execinfo.hwnd = None
+    execinfo.lpVerb = b"runas"
+    execinfo.lpFile = exe[0].encode('cp1252')
+    execinfo.lpParameters = subprocess.list2cmdline(exe[1:]).encode('cp1252')
+    execinfo.lpDirectory = None
+    execinfo.nShow = 0
+    ShellExecuteEx(byref(execinfo))
+    proc = FakePopen(execinfo.hProcess)
+    logger.debug("##started process %r %r", proc.pid, pipe.pipename)
+    return (proc, pipe)
+
+
+def _spawn_sudo(proxy, user, password, domain):
     """Spawn the sudo slave process, returning proc and a pipe to message it.
 
     This function spawns the proxy app with administrator privileges, using
@@ -160,27 +271,61 @@ def spawn_sudo(proxy, user, password, domain):
     exe = exe + args
     nul = subprocess.DEVNULL
     pipe = subprocess.PIPE
-    kwds = dict(stdin=pipe, stdout=pipe, stderr=nul, close_fds=True, text=False)
+
+    si = subprocess.STARTUPINFO()
+    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    kwds = dict(stdin=pipe, stdout=pipe, stderr=nul, close_fds=False, text=False,
+                creationflags=subprocess.CREATE_NO_WINDOW, bufsize=0)
+    # kwds = dict(text=False)
     logger.debug("start subprocess %r", exe)
     proc = subprocess.Popen(exe, **kwds)
-    proc.stdin.write(pickle.dumps((user, domain, password)))
-    proc.stdin.flush()
-    return proc, base.StdPipe(proc.stdout, proc.stdin)
+
+    pipe = base.StdPipe(proc.stdout, proc.stdin)
+    pipe.write(pickle.dumps((user, domain, password)))
+    result = pickle.loads(pipe.read())
+    if not result:
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.kill()
+        raise RuntimeError("wrong credentials")
+
+    logger.debug("wrote credencials %r", result)
+    return proc, pipe
 
 
 def run_proxy_startup():
-    if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
-        sys.path = base.b64unpickle(sys.argv[2])
-        proxy = base.b64unpickle(sys.argv[3])
-        pipe = base.StdPipe(os.fdopen(sys.stdin.fileno(), "rb"),
-                            os.fdopen(sys.stdout.fileno(), "wb"))
+    log_format = (
+        "> runas %(created)f %(levelname)s %(name)s %(pathname)s(%(lineno)d): %(message)s")
+    logging.basicConfig(level=logging.DEBUG, format=log_format, filename="runasc.log", filemode="w")
+    logger.debug("_start proxy %r", sys.argv)
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
+            sys.path = base.b64unpickle(sys.argv[2])
+            proxy = base.b64unpickle(sys.argv[3])
+            pipename = sys.argv[4]
+            logger.debug("_loaded pipe %r", pipename)
+            pipe = Win32Pipe(pipename)
+            logger.debug("_connected to pipe %r", pipename)
 
-        user, domain, password = pickle.load(pipe)
-        handle = win32security.LogonUser(
-            user, domain, password, win32con.LOGON32_LOGON_INTERACTIVE,
-            win32con.LOGON32_PROVIDER_DEFAULT)
-        win32security.ImpersonateLoggedOnUser(handle)
-        proxy.run(pipe)
-        win32security.RevertToSelf()
-        handle.close()
-        sys.exit(0)
+            """
+            user, domain, password = pickle.loads(pipe.read())
+            try:
+                handle = win32security.LogonUser(
+                    user, domain, password, win32con.LOGON32_LOGON_INTERACTIVE,
+                    win32con.LOGON32_PROVIDER_DEFAULT)
+                win32security.ImpersonateLoggedOnUser(handle)
+                pipe.write(pickle.dumps(True))
+            except Exception as e:
+                logger.exception("error impersonating %r\n%r", e, (user, domain, password))
+                pipe.write(pickle.dumps(False))
+                sys.exit(1)
+            """
+
+            proxy.run(pipe)
+            logger.debug("_done")
+            # win32security.RevertToSelf()
+            # handle.close()
+            sys.exit(0)
+    except BaseException as e:
+        logger.exception("error %r", e)

@@ -8,6 +8,9 @@ import sys
 import base64
 import struct
 import pickle
+import logging
+
+logger = logging.getLogger("runas")
 
 
 def b64pickle(obj):

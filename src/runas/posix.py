@@ -70,7 +70,7 @@ def spawn_sudo(proxy, user, password, domain):
         proc.stdin.close()
         proc.stdout.close()
         proc.kill()
-        raise RuntimeError("wrong password")
+        raise RuntimeError("wrong credentials")
 
     return proc, base.StdPipe(proc.stdout, proc.stdin)
 
