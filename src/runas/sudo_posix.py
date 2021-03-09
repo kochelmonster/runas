@@ -7,7 +7,10 @@ import sys
 import errno
 import subprocess
 import tempfile
+import logging
 from . import sudo_base as base
+
+logger = logging.getLogger("runas")
 
 
 def has_root():
@@ -111,40 +114,40 @@ def find_exe(name, *args):
     return None
 
 
-def spawn_sudo(proxy):
+def spawn_sudo(proxy, user, password):
     """Spawn the sudo slave process, returning proc and a pipe to message it."""
-    nul = subprocess.DEVNULL
     pipe = SecureStringPipe()
     c_pipe = pipe.connect()
     exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
     args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy),
             base.b64pickle(c_pipe)]
     # Look for a variety of sudo-like programs
-    sudo = None
-    if "DISPLAY" in os.environ:
-        sudo = find_exe("pkexec")
-        if sudo is None:
-            sudo = find_exe("gksudo", "-k", "-D", proxy.display_name, "--")
-        if sudo is None:
-            sudo = find_exe("kdesudo")
-        if sudo is None:
-            sudo = find_exe("cocoasudo", f"--prompt='{proxy.display_name}'")
+    sudo = find_exe("sudo")
     if sudo is None:
-        sudo = find_exe("sudo")
-    if sudo is None:
-        sudo = []
+        raise RuntimeError("no sudo found")
+
     # Make it a slave process so it dies if we die
+    sudo.append("-k")
+    sudo.append("-u")
+    sudo.append(user)
+    sudo.append("-S")
     exe = sudo + exe + args
     # Pass the pipe in environment vars, they seem to be harder to snoop.
-    env = os.environ.copy()
+
     # Spawn the subprocess
-    # kwds = dict(stdin=nul, stdout=nul, stderr=nul, close_fds=True, env=env)
-    kwds = dict(stdin=nul, close_fds=True, env=env)
+    # kwds = dict(stdin=nul, stdout=nul, stderr=nul, close_fds=True)
+    nul = subprocess.DEVNULL
+    spipe = subprocess.PIPE
+    kwds = dict(stdin=spipe, stderr=nul, stdout=nul, close_fds=True, universal_newlines=True)
+    logger.debug("start subprocess %r", exe)
     proc = subprocess.Popen(exe, **kwds)
+    proc.stdin.write(password+"\n")
+    proc.stdin.close()
     return (proc, pipe)
 
 
 def run_proxy_startup():
+    logger.debug("run_proxy_startup %r", sys.argv)
     if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
         sys.path = base.b64unpickle(sys.argv[2])
         proxy = base.b64unpickle(sys.argv[3])

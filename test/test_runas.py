@@ -1,5 +1,6 @@
 """test autoupdate methods"""
 import sys
+import os
 import unittest
 from pathlib import Path
 from commands import SudoCommands
@@ -11,10 +12,10 @@ sys.path.append(DIR)
 
 
 class TestSudo(unittest.TestCase):
-    def test_autoupdate(self):
+    def test_runas(self):
         self.assertTrue(can_get_root())
         proxy = SudoProxy(SudoCommands())
-        proxy.start()
+        proxy.start("root", os.environ["PASS"])
         self.assertTrue(proxy.is_root())
         proxy.terminate()
 

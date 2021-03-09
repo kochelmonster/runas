@@ -35,17 +35,12 @@ import pickle
 
 if sys.platform == "win32":
     from . import sudo_win32 as sudo
-elif sys.platform == "darwin":
-    try:
-        from . import sudo_osx as sudo
-    except ImportError:
-        from . import sudo_unix as sudo
 else:
-    from . import sudo_unix as sudo
+    from . import sudo_posix as sudo
 
 
-def spawn_sudo(proxy):
-    return sudo.spawn_sudo(proxy)
+def spawn_sudo(proxy, user, password):
+    return sudo.spawn_sudo(proxy, user, password)
 
 
 def has_root():
@@ -67,16 +62,15 @@ class SudoProxy:
     with root privileges.
     """
 
-    def __init__(self, target, display_name="proxy"):
+    def __init__(self, target):
         #  Reflect the 'name' attribute if it has one, but don't worry
         #  if not.  This helps SudoProxy be re-used on other classes.
         self.target = target
-        self.display_name = display_name
         self.closed = False
         self.pipe = None
 
-    def start(self):
-        (self.proc, self.pipe) = spawn_sudo(self)
+    def start(self, user, password):
+        (self.proc, self.pipe) = spawn_sudo(self, user, password)
         if self.proc.poll() is not None:
             raise RuntimeError("sudo helper process terminated unexpectedly")
         #  Try to read initialisation message from the pipe.
