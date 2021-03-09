@@ -27,82 +27,6 @@ def can_get_root():
     return True
 
 
-class SecureStringPipe(base.SecureStringPipe):
-    """A two-way pipe for securely communicating with a sudo subprocess.
-
-    On unix this is implemented as a pair of fifos.  It would be more secure
-    to use anonymous pipes, but they're not reliably inherited through sudo
-    wrappers such as gksudo.
-
-    Unfortunately this leaves the pipes wide open to hijacking by other
-    processes running as the same user.  Security depends on secrecy of the
-    message-hashing token, which we pass to the slave in its env vars.
-    """
-
-    def __init__(self, token=None, data=None):
-        super().__init__(token)
-        self.rfd = None
-        self.wfd = None
-        if data is None:
-            self.tdir = tempfile.mkdtemp()
-            self.rnm = os.path.join(self.tdir, "master")
-            self.wnm = os.path.join(self.tdir, "slave")
-            os.mkfifo(self.rnm, 0o600)
-            os.mkfifo(self.wnm, 0o600)
-        else:
-            self.tdir, self.rnm, self.wnm = data
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def connect(self):
-        return SecureStringPipe(self.token, (self.tdir, self.wnm, self.rnm))
-
-    def _read(self, size):
-        return os.read(self.rfd, size)
-
-    def _write(self, data):
-        return os.write(self.wfd, data)
-
-    def _open(self):
-        if self.rnm.endswith("master"):
-            self.rfd = os.open(self.rnm, os.O_RDONLY)
-            self.wfd = os.open(self.wnm, os.O_WRONLY)
-        else:
-            self.wfd = os.open(self.wnm, os.O_WRONLY)
-            self.rfd = os.open(self.rnm, os.O_RDONLY)
-        os.unlink(self.wnm)
-
-    def _recover(self):
-        try:
-            os.close(os.open(self.rnm, os.O_WRONLY))
-        except EnvironmentError:
-            pass
-        try:
-            os.close(os.open(self.wnm, os.O_RDONLY))
-        except EnvironmentError:
-            pass
-
-    def close(self):
-        if self.rfd is not None:
-            os.close(self.rfd)
-            os.close(self.wfd)
-            self.rfd = None
-            self.wfd = None
-            if os.path.isfile(self.wnm):
-                os.unlink(self.wnm)
-            try:
-                if not os.listdir(self.tdir):
-                    os.rmdir(self.tdir)
-            except EnvironmentError as e:
-                if e.errno != errno.ENOENT:
-                    raise
-        super().close()
-
-
 def find_exe(name, *args):
     path = os.environ.get("PATH", "/bin:/usr/bin").split(":")
     if getattr(sys, "frozen", False):
@@ -114,13 +38,28 @@ def find_exe(name, *args):
     return None
 
 
+class StdPipe(base.StringPipe):
+    def __init__(self, read, write):
+        self.read_stream = read
+        self.write_stream = write
+
+    def _read(self, size):
+        return self.read_stream.read(size)
+
+    def _write(self, data):
+        self.write_stream.write(data)
+        self.write_stream.flush()
+
+    def close(self):
+        super().close()
+        self.read_stream.close()
+        self.write_stream.close()
+
+
 def spawn_sudo(proxy, user, password):
     """Spawn the sudo slave process, returning proc and a pipe to message it."""
-    pipe = SecureStringPipe()
-    c_pipe = pipe.connect()
     exe = [sys.executable, "-c", "import runas; runas.run_proxy_startup()"]
-    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy),
-            base.b64pickle(c_pipe)]
+    args = ["--runas-spawn-sudo", base.b64pickle(sys.path), base.b64pickle(proxy)]
     # Look for a variety of sudo-like programs
     sudo = find_exe("sudo")
     if sudo is None:
@@ -135,15 +74,14 @@ def spawn_sudo(proxy, user, password):
     # Pass the pipe in environment vars, they seem to be harder to snoop.
 
     # Spawn the subprocess
-    # kwds = dict(stdin=nul, stdout=nul, stderr=nul, close_fds=True)
     nul = subprocess.DEVNULL
-    spipe = subprocess.PIPE
-    kwds = dict(stdin=spipe, stderr=nul, stdout=nul, close_fds=True, universal_newlines=True)
+    pipe = subprocess.PIPE
+    kwds = dict(stdin=pipe, stdout=pipe, stderr=nul, close_fds=True, text=False)
     logger.debug("start subprocess %r", exe)
     proc = subprocess.Popen(exe, **kwds)
-    proc.stdin.write(password+"\n")
-    proc.stdin.close()
-    return (proc, pipe)
+    proc.stdin.write(password.encode("utf8")+b"\n")
+    proc.stdin.flush()
+    return proc, StdPipe(proc.stdout, proc.stdin)
 
 
 def run_proxy_startup():
@@ -151,6 +89,6 @@ def run_proxy_startup():
     if len(sys.argv) > 1 and sys.argv[1] == "--runas-spawn-sudo":
         sys.path = base.b64unpickle(sys.argv[2])
         proxy = base.b64unpickle(sys.argv[3])
-        pipe = base.b64unpickle(sys.argv[4])
-        proxy.run(pipe)
+        proxy.run(StdPipe(os.fdopen(sys.stdin.fileno(), "rb"),
+                          os.fdopen(sys.stdout.fileno(), "wb")))
         sys.exit(0)

@@ -2,6 +2,7 @@
 import sys
 import os
 import unittest
+import logging
 from pathlib import Path
 from commands import SudoCommands
 from runas import SudoProxy, can_get_root
@@ -21,4 +22,7 @@ class TestSudo(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    log_format = (
+        "> runas %(created)f %(levelname)s %(name)s %(pathname)s(%(lineno)d): %(message)s")
+    logging.basicConfig(level=logging.DEBUG, format=log_format, filename="runas.log", filemode="w")
     unittest.main()
